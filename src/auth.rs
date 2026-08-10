@@ -68,6 +68,16 @@ fn unix_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
 }
 
+fn unix_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+/// Discard a cached token this long before it actually expires.
+///
+/// Guards against a token that is valid when read but dead by the time the
+/// request lands, and against modest clock skew between here and Anker.
+const TOKEN_EXPIRY_SKEW_SECS: i64 = 3600;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenCache {
     auth_token: String,
@@ -75,6 +85,13 @@ struct TokenCache {
     token_expires_at: i64,
     #[serde(default)]
     nick_name: String,
+}
+
+impl TokenCache {
+    /// Whether this token is still worth sending at `now` (unix seconds).
+    fn is_usable_at(&self, now: i64) -> bool {
+        self.token_expires_at.saturating_sub(TOKEN_EXPIRY_SKEW_SECS) > now
+    }
 }
 
 pub struct AnkerSession {
@@ -157,9 +174,18 @@ impl AnkerSession {
         Ok(headers)
     }
 
+    /// The cached token, if one is on disk and still usable.
+    ///
+    /// An expired token is treated as no token at all. A stale one would
+    /// still *work* -- `post_json_inner` re-authenticates on 401 -- but only
+    /// after spending a doomed round trip, and only for callers that go
+    /// through it. Checking here keeps [`login`](Self::login) honest: when
+    /// it returns `Ok`, the session really is authenticated.
     async fn load_cache(&self) -> Option<TokenCache> {
         let bytes = tokio::fs::read(&self.cache_path).await.ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let token: TokenCache = serde_json::from_slice(&bytes).ok()?;
+
+        token.is_usable_at(unix_secs()).then_some(token)
     }
 
     async fn save_cache(&self, token: &TokenCache) -> Result<()> {
@@ -172,8 +198,9 @@ impl AnkerSession {
         Ok(())
     }
 
-    /// Log in, using the local token cache if present. Pass `force = true` to
-    /// discard any cache and always perform a fresh login.
+    /// Log in, reusing the local token cache when it holds a token that has
+    /// not expired. Pass `force = true` to ignore the cache and always
+    /// perform a fresh login.
     pub async fn login(&self, force: bool) -> Result<()> {
         if !force && let Some(cached) = self.load_cache().await {
             *self.token.write().await = Some(cached);
@@ -221,9 +248,18 @@ impl AnkerSession {
     /// POST an authenticated JSON request against a relative endpoint path,
     /// re-authenticating once on 401/403 and retrying once on 429.
     pub async fn post_json(&self, endpoint: &str, body: Value) -> Result<Value> {
-        if self.token.read().await.is_none() {
+        // Expiry is checked here too, not just at login: a long-running
+        // monitor holds one session for weeks, so the in-memory token can
+        // age out mid-run. The 401 path below would still recover, but only
+        // after a wasted request.
+        let needs_login = match self.token.read().await.as_ref() {
+            Some(token) => !token.is_usable_at(unix_secs()),
+            None => true,
+        };
+        if needs_login {
             self.login(false).await?;
         }
+
         self.post_json_inner(endpoint, body, false).await
     }
 
@@ -281,4 +317,65 @@ fn check_api_code(value: &Value) -> Result<()> {
 #[allow(dead_code)]
 fn authcache_dir() -> &'static Path {
     Path::new(".authcache")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(expires_at: i64) -> TokenCache {
+        TokenCache {
+            auth_token: "t".to_string(),
+            user_id: "u".to_string(),
+            token_expires_at: expires_at,
+            nick_name: String::new(),
+        }
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn a_token_well_before_expiry_is_usable() {
+        assert!(token(NOW + 30 * 86400).is_usable_at(NOW));
+    }
+
+    #[test]
+    fn an_expired_token_is_not_usable() {
+        assert!(!token(NOW - 1).is_usable_at(NOW));
+    }
+
+    #[test]
+    fn a_token_inside_the_skew_window_is_already_treated_as_dead() {
+        // Still nominally valid for another half hour, but not long enough
+        // to trust with a request.
+        assert!(!token(NOW + 1800).is_usable_at(NOW));
+        // One second past the skew boundary is fine.
+        assert!(token(NOW + TOKEN_EXPIRY_SKEW_SECS + 1).is_usable_at(NOW));
+    }
+
+    #[test]
+    fn a_nonsense_expiry_does_not_overflow() {
+        // Guards the saturating_sub: a corrupt or zeroed cache file must
+        // read as unusable rather than panic.
+        assert!(!token(i64::MIN).is_usable_at(NOW));
+        assert!(!token(0).is_usable_at(NOW));
+        assert!(token(i64::MAX).is_usable_at(NOW));
+    }
+
+    #[test]
+    fn cache_json_from_the_wire_round_trips() {
+        // Shape as Anker returns it -- extra fields ignored, nick_name
+        // optional.
+        let json = r#"{
+            "auth_token": "abc",
+            "user_id": "def",
+            "token_expires_at": 1788738071,
+            "unrelated": 1
+        }"#;
+
+        let token: TokenCache = serde_json::from_str(json).expect("parses");
+        assert_eq!(token.auth_token, "abc");
+        assert_eq!(token.token_expires_at, 1788738071);
+        assert_eq!(token.nick_name, "");
+    }
 }

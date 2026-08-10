@@ -3,3 +3,4 @@
 /.authcache
 
 .env
+.DS_Store
