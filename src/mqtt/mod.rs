@@ -106,6 +106,21 @@ fn build_publish_envelope(info: &MqttInfo, device: &Device, hex_command: &[u8]) 
     envelope.to_string()
 }
 
+fn realtime_trigger_message(
+    info: &MqttInfo,
+    device: &Device,
+    enable: bool,
+    timeout_secs: u32,
+) -> (String, String) {
+    let command = c1000gen2::build_realtime_trigger(enable, timeout_secs);
+    let topic = format!(
+        "{}req",
+        topic_prefix(&info.app_name, &device.device_pn, &device.device_sn, true)
+    );
+
+    (topic, build_publish_envelope(info, device, &command))
+}
+
 /// Publish a realtime-trigger command for `device`, enabling (or disabling)
 /// live `0421` updates for `timeout_secs` seconds.
 pub async fn publish_realtime_trigger(
@@ -115,22 +130,30 @@ pub async fn publish_realtime_trigger(
     enable: bool,
     timeout_secs: u32,
 ) -> Result<()> {
-    let command = c1000gen2::build_realtime_trigger(enable, timeout_secs);
-    let topic = format!(
-        "{}req",
-        topic_prefix(&info.app_name, &device.device_pn, &device.device_sn, true)
-    );
-    let body = build_publish_envelope(info, device, &command);
+    let (topic, body) = realtime_trigger_message(info, device, enable, timeout_secs);
     client.publish(topic, QoS::AtMostOnce, false, body).await?;
 
     Ok(())
 }
+
+/// Longest wait between reconnect attempts. The first few retries stay
+/// quick, but a network that has been down for a while (DNS outage, host
+/// off the air) should not be hammered every 2s for hours.
+const MAX_RECONNECT_BACKOFF_SECS: u64 = 30;
 
 /// Spawn a background task that subscribes to the device's status topic and
 /// keeps writing newly decoded `0421` status into `status` as messages
 /// arrive. Also resends the realtime trigger every `timeout_secs - 5`
 /// seconds so the device keeps streaming (mirrors `message_poller`'s
 /// `restart` check in `mqtt.py:729-732`).
+///
+/// The subscribe is driven off every CONNACK, not done once at startup.
+/// rumqttc reconnects on its own after a dropped connection, but we open
+/// with `clean_session`, so the broker throws the session away and keeps no
+/// subscription for us -- and rumqttc does not replay subscribes either
+/// (only unacked publishes survive in its pending queue). Subscribing once
+/// up front therefore produced a daemon that looked healthy after any
+/// network blip while receiving nothing at all, until someone restarted it.
 pub fn spawn_monitor(
     mut conn: MqttConnection,
     device: Device,
@@ -142,10 +165,6 @@ pub fn spawn_monitor(
             "{}#",
             topic_prefix(&conn.info.app_name, &device.device_pn, &device.device_sn, false)
         );
-        if let Err(e) = conn.client.subscribe(sub_topic, QoS::AtMostOnce).await {
-            eprintln!("MQTT subscribe failed: {e}");
-            return;
-        }
 
         let client = conn.client.clone();
         let info = conn.info.clone();
@@ -160,8 +179,30 @@ pub fn spawn_monitor(
             }
         });
 
+        let mut backoff_secs = 1;
         loop {
             match conn.eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    backoff_secs = 1;
+
+                    // `try_*` rather than the awaiting variants: this task
+                    // owns the event loop, so blocking here on a full
+                    // request channel would deadlock the very loop that
+                    // drains it.
+                    if let Err(e) = conn.client.try_subscribe(sub_topic.clone(), QoS::AtMostOnce) {
+                        eprintln!("MQTT subscribe failed: {e}");
+                        continue;
+                    }
+
+                    // Re-arm streaming immediately. The keepalive task is on
+                    // its own ~5min timer, and waiting for it would leave a
+                    // silent gap after every reconnect even though the
+                    // subscription is already back.
+                    let (topic, body) = realtime_trigger_message(&conn.info, &device, true, timeout_secs);
+                    if let Err(e) = conn.client.try_publish(topic, QoS::AtMostOnce, false, body) {
+                        eprintln!("realtime trigger publish failed: {e}");
+                    }
+                }
                 Ok(Event::Incoming(Packet::Publish(p))) => {
                     if let Some(decoded) = decode_publish(&p.payload) {
                         *status.write().await = decoded;
@@ -170,7 +211,8 @@ pub fn spawn_monitor(
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("MQTT connection error: {e}");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_RECONNECT_BACKOFF_SECS);
                 }
             }
         }
