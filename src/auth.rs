@@ -6,7 +6,7 @@
 //! limiting beyond a basic 429 retry) -- see the Rust port plan for scope.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -27,6 +27,13 @@ use crate::error::{AnkerError, Result};
 const API_PUBLIC_KEY_HEX: &str = "04c5c00c4f8d1197cc7c3167c52bf7acb054d722f0ef08dcd7e0883236e0d72a3868d9750cb47fa4619248f3d83f0f662671dadc6e2d31c2f41db0161651c7c076";
 
 const API_LOGIN: &str = "passport/login";
+
+/// Ceiling on establishing a TCP+TLS connection to the Anker API.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ceiling on a whole request, connection included. Generous: these are
+/// small JSON calls, so anything near this is a network in trouble rather
+/// than a slow response.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Country -> region mapping (apitypes.py:23-98), used to pick the API base URL.
 const COM_COUNTRIES: &[&str] = &[
@@ -121,8 +128,20 @@ impl AnkerSession {
 
         let cache_path = PathBuf::from(".authcache").join(format!("{email}.json"));
 
+        // Timeouts are not optional here. `Client::new()` has none at all,
+        // so a connection that opens and then goes quiet -- a NAT that
+        // dropped the flow, a router rebooting mid-request -- hangs the
+        // caller indefinitely. A long-running daemon calls this from its
+        // recovery path, which is exactly when the network is least well,
+        // and a recovery attempt that never returns is worse than one that
+        // fails and gets retried.
+        let http = reqwest::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()?;
+
         Ok(Self {
-            http: reqwest::Client::new(),
+            http,
             base_url: api_base_for_country(&country).to_string(),
             country,
             email,

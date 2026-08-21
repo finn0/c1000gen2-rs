@@ -106,12 +106,7 @@ fn build_publish_envelope(info: &MqttInfo, device: &Device, hex_command: &[u8]) 
     envelope.to_string()
 }
 
-fn realtime_trigger_message(
-    info: &MqttInfo,
-    device: &Device,
-    enable: bool,
-    timeout_secs: u32,
-) -> (String, String) {
+fn realtime_trigger_message(info: &MqttInfo, device: &Device, enable: bool, timeout_secs: u32) -> (String, String) {
     let command = c1000gen2::build_realtime_trigger(enable, timeout_secs);
     let topic = format!(
         "{}req",
@@ -141,6 +136,21 @@ pub async fn publish_realtime_trigger(
 /// off the air) should not be hammered every 2s for hours.
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 30;
 
+/// A spawned task that is aborted when this handle is dropped.
+///
+/// `JoinHandle` deliberately does the opposite -- dropping it detaches the
+/// task and lets it run on. The monitor needs the opposite for its
+/// keepalive: a caller that drops the monitor to rebuild the session is
+/// done with that MQTT client, and a keepalive still publishing into the
+/// discarded one would log failures for the life of the process.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Spawn a background task that subscribes to the device's status topic and
 /// keeps writing newly decoded `0421` status into `status` as messages
 /// arrive. Also resends the realtime trigger every `timeout_secs - 5`
@@ -169,15 +179,16 @@ pub fn spawn_monitor(
         let client = conn.client.clone();
         let info = conn.info.clone();
         let dev = device.clone();
-        // Runs for as long as the process does; aborted implicitly on exit.
-        let _keepalive = tokio::spawn(async move {
+        // Owned by this task, so aborting the monitor stops the keepalive
+        // with it -- see `AbortOnDrop`.
+        let _keepalive = AbortOnDrop(tokio::spawn(async move {
             loop {
                 if let Err(e) = publish_realtime_trigger(&client, &info, &dev, true, timeout_secs).await {
                     eprintln!("realtime trigger publish failed: {e}");
                 }
                 tokio::time::sleep(Duration::from_secs((timeout_secs.saturating_sub(5)).max(1) as u64)).await;
             }
-        });
+        }));
 
         let mut backoff_secs = 1;
         loop {
