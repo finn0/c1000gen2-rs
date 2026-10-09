@@ -4,6 +4,9 @@ A small, read-only Rust client for monitoring an Anker SOLIX C1000 Gen 2
 portable power station (PN `A1763` / `A1765` / `AS100`) in near real time,
 via Anker's cloud login + MQTT broker.
 
+**Live demo:** [oldschool.homes/solix](https://oldschool.homes/solix) — a
+dashboard driven by this library, polling one C1000 Gen 2 every 3 seconds.
+
 It logs into your Anker account, finds the C1000 Gen 2 device, connects to
 Anker's cloud MQTT broker over mutual TLS, and decodes the device's `0421`
 status messages into a typed, human-readable report: battery SOC/SOH/temp,

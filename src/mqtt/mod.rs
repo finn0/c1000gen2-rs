@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chrono::Local;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -56,7 +57,13 @@ pub struct MqttConnection {
     pub info: MqttInfo,
 }
 
-/// Connect to the Anker cloud MQTT broker for the account owning `session`.
+/// Build the MQTT client for the account owning `session`.
+///
+/// Despite the name this does no broker I/O beyond the REST call that
+/// fetches the certificates: rumqttc dials lazily on the first
+/// [`EventLoop::poll`], which happens in [`spawn_monitor`]. Callers must not
+/// log "connected" off the back of this returning -- the connection is only
+/// real once a CONNACK arrives, which the monitor reports.
 pub async fn connect(session: &AnkerSession) -> Result<MqttConnection> {
     let info = get_mqtt_info(session).await?;
     let client_id = format!("{}_{:05}", info.thing_name, rand::random::<u32>() % 100_000);
@@ -193,8 +200,15 @@ pub fn spawn_monitor(
         let mut backoff_secs = 1;
         loop {
             match conn.eventloop.poll().await {
-                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                Ok(Event::Incoming(Packet::ConnAck(ack))) => {
                     backoff_secs = 1;
+                    // Timestamped to match the host daemon's own log lines;
+                    // this one is routine, not an error path.
+                    eprintln!(
+                        "{}  MQTT connected: {:?}, subscribing {sub_topic}",
+                        Local::now().format("%Y-%m-%d %H:%M:%S"),
+                        ack.code
+                    );
 
                     // `try_*` rather than the awaiting variants: this task
                     // owns the event loop, so blocking here on a full
